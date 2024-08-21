@@ -1,4 +1,4 @@
-# from https://github.com/NVIDIA/warp/blob/release-1.2/warp/sim/import_urdf.py
+# from https://github.com/NVIDIA/warp/blob/release-1.3/warp/sim/import_urdf.py
 
 # Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
 # NVIDIA CORPORATION and its licensors retain all intellectual property

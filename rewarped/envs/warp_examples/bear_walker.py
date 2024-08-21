@@ -1,4 +1,4 @@
-# from https://github.com/NVIDIA/warp/blob/release-1.2/warp/examples/optim/example_walker.py
+# from https://github.com/NVIDIA/warp/blob/release-1.3/warp/examples/optim/example_walker.py
 
 # Copyright (c) 2024 NVIDIA CORPORATION.  All rights reserved.
 # NVIDIA CORPORATION and its licensors retain all intellectual property
