@@ -23,75 +23,91 @@ import math
 import os
 
 import numpy as np
+import torch
+import torch.nn as nn
+from gym import spaces
 from pxr import Usd, UsdGeom
 
 import warp as wp
 import warp.examples
-import warp.optim
-import warp.sim
-import warp.sim.render
+
+from ...environment import IntegratorType, run_env
+from ...warp_env import WarpEnv
 
 
-@wp.kernel
-def loss_kernel(com: wp.array(dtype=wp.vec3), loss: wp.array(dtype=float)):
-    tid = wp.tid()
-    vx = com[tid][0]
-    vy = com[tid][1]
-    vz = com[tid][2]
-    delta = wp.sqrt(vx * vx) + wp.sqrt(vy * vy) - vz
+class Walker(WarpEnv):
+    sim_name = "Walker" + "WarpExamples"
+    env_offset = (0.0, 0.0, 10.0)
 
-    wp.atomic_add(loss, 0, delta)
+    eval_fk = False
+    eval_ik = False
 
+    # integrator_type = IntegratorType.EULER
+    # sim_substeps_euler = 80
+    # euler_settings = dict(angular_damping=0.05)
 
-@wp.kernel
-def com_kernel(velocities: wp.array(dtype=wp.vec3), n: int, com: wp.array(dtype=wp.vec3)):
-    tid = wp.tid()
-    v = velocities[tid]
-    a = v / wp.float32(n)
-    wp.atomic_add(com, 0, a)
+    integrator_type = IntegratorType.FEATHERSTONE
+    sim_substeps_featherstone = 80
+    featherstone_settings = dict(angular_damping=0.05, update_mass_matrix_every=sim_substeps_featherstone)
 
+    up_axis = "Y"
+    ground_plane = True
 
-@wp.kernel
-def compute_phases(phases: wp.array(dtype=float), sim_time: float):
-    tid = wp.tid()
-    phases[tid] = wp.sin(phase_freq * sim_time + wp.float32(tid) * phase_step)
+    state_tensors_names = ("particle_q", "particle_qd")
+    control_tensors_names = ("tet_activations",)
 
-
-@wp.kernel
-def activation_function(tet_activations: wp.array(dtype=float), activation_inputs: wp.array(dtype=float)):
-    tid = wp.tid()
-    activation = wp.tanh(activation_inputs[tid])
-    tet_activations[tid] = activation_strength * activation
-
-
-phase_count = 8
-phase_step = wp.constant((2.0 * math.pi) / phase_count)
-phase_freq = wp.constant(5.0)
-activation_strength = wp.constant(0.3)
-
-
-class Example:
-    def __init__(self, stage_path="example_walker.usd", verbose=False, num_frames=300):
-        self.verbose = verbose
-
-        fps = 60
-        self.frame_dt = 1.0 / fps
-        self.num_frames = num_frames
-
-        self.sim_substeps = 80
-        self.sim_dt = self.frame_dt / self.sim_substeps
-        self.sim_time = 0.0
-
-        self.iter = 0
-        self.train_rate = 0.025
-
-        self.phase_count = phase_count
-
-        self.render_time = 0.0
-
+    def __init__(
+        self,
+        num_envs=8,
+        episode_length=300,
+        early_termination=False,
+        **kwargs,
+    ):
         # bear
-        asset_stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "bear.usd"))
+        full_num_obs = 1986  # model.particle_count
+        full_num_act = 5354  # model.tet_count
+        particle_q_downsample = 6
+        action_scale = 0.3  # activation_strength
+        act_downsample = 17  # 17 | 35 | 45 | 51 ... (full_num_act // N + 1) * N - full_num_act == 1
+        act_padding = 1
 
+        num_obs = full_num_obs // particle_q_downsample
+        num_act = full_num_act // act_downsample
+        super().__init__(num_envs, num_obs, num_act, episode_length, early_termination, **kwargs)
+
+        self.particle_q_downsample = particle_q_downsample
+        self.action_scale = action_scale
+        self.act_downsample = act_downsample
+        self.act_padding = act_padding
+
+        self.phase_count = 8
+        self.phase_step = 2.0 * math.pi / self.phase_count
+        self.phase_freq = 5.0
+
+    @property
+    def observation_space(self):
+        d = {
+            "phase": spaces.Box(low=-np.inf, high=np.inf, shape=(self.phase_count,), dtype=np.float32),
+            "loss": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            "com_q": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            "com_qd": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            "particle_q": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_obs, 3), dtype=np.float32),
+            "particle_qd": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_obs, 3), dtype=np.float32),
+            "actions": spaces.Box(low=-1.0, high=1.0, shape=(self.num_act,), dtype=np.float32),
+        }
+        d = spaces.Dict(d)
+        return d
+
+    def create_modelbuilder(self):
+        builder = super().create_modelbuilder()
+        builder.default_particle_radius = 0.05
+        return builder
+
+    def create_env(self, builder):
+        self.create_bear(builder)
+
+    def create_bear(self, builder):
+        asset_stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "bear.usd"))
         geom = UsdGeom.Mesh(asset_stage.GetPrimAtPath("/root/bear"))
         points = geom.GetPointsAttr().Get()
 
@@ -99,18 +115,16 @@ class Example:
         for i in range(len(points)):
             points[i] = xform.Transform(points[i])
 
-        self.points = [wp.vec3(point) for point in points]
-        self.tet_indices = geom.GetPrim().GetAttribute("tetraIndices").Get()
+        points = [wp.vec3(point) for point in points]
+        tet_indices = geom.GetPrim().GetAttribute("tetraIndices").Get()
 
-        # sim model
-        builder = wp.sim.ModelBuilder()
         builder.add_soft_mesh(
             pos=wp.vec3(0.0, 0.5, 0.0),
-            rot=wp.quat_identity(),
+            rot=wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), math.pi * 0.5),
             scale=1.0,
             vel=wp.vec3(0.0, 0.0, 0.0),
-            vertices=self.points,
-            indices=self.tet_indices,
+            vertices=points,
+            indices=tet_indices,
             density=1.0,
             k_mu=2000.0,
             k_lambda=2000.0,
@@ -122,185 +136,215 @@ class Example:
             tri_lift=0.0,
         )
 
-        # finalize model
-        self.model = builder.finalize(requires_grad=True)
-        self.control = self.model.control()
+    def create_model(self):
+        model = super().create_model()
 
-        self.model.soft_contact_ke = 2.0e3
-        self.model.soft_contact_kd = 0.1
-        self.model.soft_contact_kf = 10.0
-        self.model.soft_contact_mu = 0.7
+        # bear
+        model.soft_contact_ke = 2.0e3
+        model.soft_contact_kd = 0.1
+        model.soft_contact_kf = 10.0
+        model.soft_contact_mu = 0.7
 
-        radii = wp.zeros(self.model.particle_count, dtype=float)
-        radii.fill_(0.05)
-        self.model.particle_radius = radii
-        self.model.ground = True
+        # # NOTE: unneeded since setting default_particle_radius in create_modelbuilder()
+        # radii = wp.zeros(model.particle_count, dtype=float)
+        # r = 0.05
+        # radii.fill_(r)
+        # model.particle_radius = radii
 
-        # allocate sim states
-        self.states = []
-        for _i in range(self.num_frames * self.sim_substeps + 1):
-            self.states.append(self.model.state(requires_grad=True))
+        return model
 
-        # initialize the integrator.
-        self.integrator = wp.sim.SemiImplicitIntegrator()
+    def init_sim(self):
+        super().init_sim()
+        self.print_model_info()
 
-        # model input
-        self.phases = []
-        for _i in range(self.num_frames):
-            self.phases.append(wp.zeros(self.phase_count, dtype=float, requires_grad=True))
+        with torch.no_grad():
+            self.tet_activations = wp.to_torch(self.model.tet_activations).view(self.num_envs, -1).clone()
+            self.tet_activations_indices = ...
+
+    def reset_idx(self, env_ids):
+        if self.early_termination:
+            raise NotImplementedError
+        else:
+            super().reset_idx(env_ids)
+
+    def randomize_init(self, env_ids):
+        pass
+
+    def pre_physics_step(self, actions):
+        actions = actions.view(self.num_envs, -1)
+        actions = torch.clip(actions, -1.0, 1.0)
+        self.actions = actions
+        acts = self.action_scale * actions
+
+        if self.act_downsample is not None:
+            N = self.model.tet_count // self.num_envs
+            acts = torch.cat([acts, torch.zeros(self.num_envs, self.act_padding, device=self.device)], dim=-1)
+            acts = torch.repeat_interleave(acts, self.act_downsample, dim=-1)
+            acts = acts[:, :N]
+
+        if self.tet_activations_indices is ...:
+            self.control.assign("tet_activations", acts.flatten())
+        else:
+            tet_activations = self.scatter_actions(self.tet_activations, self.tet_activations_indices, acts)
+            self.control.assign("tet_activations", tet_activations.flatten())
+
+    def compute_observations(self):
+        particle_q = self.state.particle_q.clone().view(self.num_envs, -1, 3)
+        particle_qd = self.state.particle_qd.clone().view(self.num_envs, -1, 3)
+
+        particle_q -= self.env_offsets.view(self.num_envs, 1, 3)
+
+        com_q = particle_q.mean(1)
+        # compute center of mass velocity
+        com_qd = particle_qd.mean(1)
+
+        loss = com_qd[:, 2].pow(2).sqrt() + com_qd[:, 1].pow(2).sqrt() - com_qd[:, 0]  # sqrt(vz**2) + sqrt(vy**2) - vx
+        loss = loss.reshape(self.num_envs, 1)
+
+        phase_count, phase_step, phase_freq = (
+            self.phase_count,
+            self.phase_step,
+            self.phase_freq,
+        )
+        sim_time = self.progress_buf * self.frame_dt
+        phase_counts = (
+            torch.arange(phase_count, dtype=torch.float, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        )
+        phase = torch.sin(phase_freq * sim_time.unsqueeze(-1) + phase_counts * phase_step)
+
+        particle_q = particle_q[:, :: self.particle_q_downsample, :]
+        particle_qd = particle_qd[:, :: self.particle_q_downsample, :]
+
+        self.obs_buf = {
+            "phase": phase,
+            "loss": loss,
+            "com_q": com_q,
+            "com_qd": com_qd,
+            "particle_q": particle_q,
+            "particle_qd": particle_qd,
+            "actions": self.actions.clone(),
+        }
+
+    def compute_reward(self):
+        loss = self.obs_buf["loss"].squeeze(-1)
+        rew = -loss
+
+        reset_buf, progress_buf = self.reset_buf, self.progress_buf
+        max_episode_steps, early_termination = (
+            self.episode_length,
+            self.early_termination,
+        )
+        truncated = progress_buf > max_episode_steps - 1
+        reset = torch.where(truncated, torch.ones_like(reset_buf), reset_buf)
+        if early_termination:
+            raise NotImplementedError
+        else:
+            terminated = torch.where(torch.zeros_like(reset), torch.ones_like(reset), reset)
+        self.rew_buf, self.reset_buf, self.terminated_buf, self.truncated_buf = rew, reset, terminated, truncated
+
+    def run(self):
+        train_iters = 30
+        train_rate = 0.025
+
+        tet_count = self.num_act
+        phase_count, phase_step, phase_freq = (
+            self.phase_count,
+            self.phase_step,
+            self.phase_freq,
+        )
+
+        phases = []
+        for i in range(self.episode_length):
+            phase = torch.zeros(phase_count, dtype=torch.float, device=self.device, requires_grad=True)
+            phases.append(phase)
 
         # single layer linear network
+        k = 1.0 / phase_count
+        net = nn.Sequential(
+            nn.Linear(phase_count, tet_count, bias=True),
+            nn.Tanh(),
+        )
+        weights, bias = net[0].weight, net[0].bias
         rng = np.random.default_rng(42)
-        k = 1.0 / self.phase_count
-        weights = rng.uniform(-np.sqrt(k), np.sqrt(k), (self.model.tet_count, self.phase_count))
-        self.weights = wp.array(weights, dtype=float, requires_grad=True)
-        self.bias = wp.zeros(self.model.tet_count, dtype=float, requires_grad=True)
+        _weights = rng.uniform(-np.sqrt(k), np.sqrt(k), (tet_count, phase_count))
+        weights.data = torch.tensor(_weights, dtype=torch.float, device=self.device, requires_grad=True)
+        # nn.init.uniform_(weights, -np.sqrt(k), np.sqrt(k))
+        nn.init.zeros_(bias)
 
-        # tanh activation layer
-        self.activation_inputs = []
-        self.tet_activations = []
-        for _i in range(self.num_frames):
-            self.activation_inputs.append(wp.zeros(self.model.tet_count, dtype=float, requires_grad=True))
-            self.tet_activations.append(wp.zeros(self.model.tet_count, dtype=float, requires_grad=True))
+        net.to(self.device)
+        net.train()
+        opt = torch.optim.Adam(net.parameters(), lr=train_rate)
+        print(net)
 
-        # optimization
-        self.loss = wp.zeros(1, dtype=float, requires_grad=True)
-        self.coms = []
-        for _i in range(self.num_frames):
-            self.coms.append(wp.zeros(1, dtype=wp.vec3, requires_grad=True))
-        self.optimizer = warp.optim.Adam([self.weights.flatten()], lr=self.train_rate)
+        for iter in range(train_iters):
+            obs = self.reset(clear_grad=True)
 
-        # rendering
-        if stage_path:
-            self.renderer = wp.sim.render.SimRenderer(self.model, stage_path)
-        else:
-            self.renderer = None
+            profiler = {}
+            with wp.ScopedTimer("episode", detailed=False, print=False, active=True, dict=profiler):
+                obses, actions, rewards, dones, infos = [obs], [], [], [], []
+                for i in range(self.episode_length):
+                    sim_time = i * self.frame_dt
+                    phase_counts = torch.arange(
+                        phase_count,
+                        dtype=torch.float,
+                        device=self.device,
+                        requires_grad=True,
+                    )
+                    phases[i] = torch.sin(phase_freq * sim_time + phase_counts * phase_step)
+                    phases[i] = phases[i].repeat(self.num_envs, 1)
+                    action = net(phases[i])
 
-        # capture forward/backward passes
-        self.use_cuda_graph = wp.get_device().is_cuda
-        if self.use_cuda_graph:
-            with wp.ScopedCapture() as capture:
-                self.tape = wp.Tape()
-                with self.tape:
-                    for i in range(self.num_frames):
-                        self.forward(i)
-                self.tape.backward(self.loss)
-            self.graph = capture.graph
+                    obs, reward, done, info = self.step(action)
 
-    def forward(self, frame):
-        with wp.ScopedTimer("network", active=self.verbose):
-            # build sinusoidal input phases
-            wp.launch(kernel=compute_phases, dim=self.phase_count, inputs=[self.phases[frame], self.sim_time])
-            # fully connected, linear transformation layer
-            wp.matmul(
-                self.weights,
-                self.phases[frame].reshape((self.phase_count, 1)),
-                self.bias.reshape((self.model.tet_count, 1)),
-                self.activation_inputs[frame].reshape((self.model.tet_count, 1)),
-            )
-            # tanh activation function
-            wp.launch(
-                kernel=activation_function,
-                dim=self.model.tet_count,
-                inputs=[self.tet_activations[frame], self.activation_inputs[frame]],
-            )
-            self.control.tet_activations = self.tet_activations[frame]
+                    obses.append(obs)
+                    actions.append(action)
+                    rewards.append(reward)
+                    dones.append(done)
+                    infos.append(info)
 
-        with wp.ScopedTimer("simulate", active=self.verbose):
-            # run simulation loop
-            for i in range(self.sim_substeps):
-                self.states[frame * self.sim_substeps + i].clear_forces()
-                self.integrator.simulate(
-                    self.model,
-                    self.states[frame * self.sim_substeps + i],
-                    self.states[frame * self.sim_substeps + i + 1],
-                    self.sim_dt,
-                    self.control,
+                actions = torch.stack(actions)
+                rewards = torch.stack(rewards)
+
+                # loss = torch.stack([obs["loss"] for obs in obses[1:]])  # skip the first observation
+                # loss = loss.sum(0)  # sum over time
+                # # loss /= self.num_envs
+
+                loss = -rewards.sum(0)
+
+                # Optimization step
+                opt.zero_grad()
+                loss.sum().backward()
+                opt.step()
+
+                grad_norm = weights.grad.norm()
+
+                print(f"Iter: {iter} Loss: {loss.tolist()}")
+                print(f"Grad W: {grad_norm.item()}")
+                print(
+                    "Traj actions:",
+                    actions.mean().item(),
+                    actions.std().item(),
+                    actions.min().item(),
+                    actions.max().item(),
                 )
-                self.sim_time += self.sim_dt
 
-        with wp.ScopedTimer("loss", active=self.verbose):
-            # compute center of mass velocity
-            wp.launch(
-                com_kernel,
-                dim=self.model.particle_count,
-                inputs=[
-                    self.states[(frame + 1) * self.sim_substeps].particle_qd,
-                    self.model.particle_count,
-                    self.coms[frame],
-                ],
-                outputs=[],
+            avg_time = np.array(profiler["episode"]).mean() / self.episode_length
+            avg_steps_second = 1000.0 * float(self.num_envs) / avg_time
+            total_time_second = np.array(profiler["episode"]).sum() / 1000.0
+
+            print(
+                f"num_envs: {self.num_envs} |",
+                f"steps/second: {avg_steps_second:.4} |",
+                f"milliseconds/step: {avg_time:.4f} |",
+                f"total_seconds: {total_time_second:.4f} |",
             )
-            # compute loss
-            wp.launch(loss_kernel, dim=1, inputs=[self.coms[frame], self.loss], outputs=[])
+            print()
 
-    def step(self):
-        with wp.ScopedTimer("step"):
-            if self.use_cuda_graph:
-                wp.capture_launch(self.graph)
-            else:
-                self.tape = wp.Tape()
-                with self.tape:
-                    for i in range(self.num_frames):
-                        self.forward(i)
-                self.tape.backward(self.loss)
+        if self.renderer is not None:
+            self.renderer.save()
 
-            # optimization
-            x = self.weights.grad.flatten()
-            self.optimizer.step([x])
-
-        loss = self.loss.numpy()
-        if self.verbose:
-            print(f"Iteration {self.iter}: {loss}")
-
-        # reset sim
-        self.sim_time = 0.0
-        self.states[0] = self.model.state(requires_grad=True)
-
-        # clear grads and zero arrays for next iteration
-        self.tape.zero()
-        self.loss.zero_()
-        for i in range(self.num_frames):
-            self.coms[i].zero_()
-
-        self.iter += 1
-
-    def render(self):
-        if self.renderer is None:
-            return
-
-        with wp.ScopedTimer("render"):
-            for i in range(self.num_frames + 1):
-                self.renderer.begin_frame(self.render_time)
-                self.renderer.render(self.states[i * self.sim_substeps])
-                self.renderer.end_frame()
-
-                self.render_time += self.frame_dt
+        return 1000.0 * float(self.num_envs) / avg_time
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument(
-        "--stage_path",
-        type=lambda x: None if x == "None" else str(x),
-        default="example_walker.usd",
-        help="Path to the output USD file.",
-    )
-    parser.add_argument("--num_frames", type=int, default=300, help="Total number of frames per training iteration.")
-    parser.add_argument("--train_iters", type=int, default=30, help="Total number of training iterations.")
-    parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
-
-    args = parser.parse_known_args()[0]
-
-    with wp.ScopedDevice(args.device):
-        example = Example(stage_path=args.stage_path, verbose=args.verbose, num_frames=args.num_frames)
-
-        for _ in range(args.train_iters):
-            example.step()
-            example.render()
-
-        if example.renderer:
-            example.renderer.save()
+    run_env(Walker, no_grad=False)
