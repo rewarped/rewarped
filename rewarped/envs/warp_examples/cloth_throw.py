@@ -21,60 +21,57 @@
 
 import math
 
+import numpy as np
+import torch
+
 import warp as wp
-import warp.sim
-import warp.sim.render
+
+from ...environment import IntegratorType, run_env
+from ...warp_env import WarpEnv
 
 
-@wp.kernel
-def com_kernel(positions: wp.array(dtype=wp.vec3), n: int, com: wp.array(dtype=wp.vec3)):
-    tid = wp.tid()
+class ClothThrow(WarpEnv):
+    sim_name = "ClothThrow" + "WarpExamples"
+    env_offset = (0.0, 0.0, 5.0)
 
-    # compute center of mass
-    wp.atomic_add(com, 0, positions[tid] / float(n))
+    eval_fk = False
+    eval_ik = False
 
+    # integrator_type = IntegratorType.EULER
+    # sim_substeps_euler = 16
+    # euler_settings = dict(angular_damping=0.0)
 
-@wp.kernel
-def loss_kernel(com: wp.array(dtype=wp.vec3), target: wp.vec3, loss: wp.array(dtype=float)):
-    # sq. distance to target
-    delta = com[0] - target
+    integrator_type = IntegratorType.FEATHERSTONE
+    sim_substeps_featherstone = 16
+    featherstone_settings = dict(angular_damping=0.0, update_mass_matrix_every=sim_substeps_featherstone)
 
-    loss[0] = wp.dot(delta, delta)
+    frame_dt = 1.0 / 60.0
+    episode_duration = 2.0  # seconds
 
+    up_axis = "Y"
+    ground_plane = False
 
-@wp.kernel
-def step_kernel(x: wp.array(dtype=wp.vec3), grad: wp.array(dtype=wp.vec3), alpha: float):
-    tid = wp.tid()
+    state_tensors_names = ("particle_q", "particle_qd")
 
-    # gradient descent step
-    x[tid] = x[tid] - grad[tid] * alpha
+    def __init__(self, num_envs=8, episode_length=-1, early_termination=False, **kwargs):
+        num_obs = 0
+        num_act = 0
 
+        episode_length = int(self.episode_duration / self.frame_dt)
+        super().__init__(num_envs, num_obs, num_act, episode_length, early_termination, **kwargs)
 
-class Example:
-    def __init__(self, stage_path="example_cloth_throw.usd", verbose=False):
-        self.verbose = verbose
+        self.action_scale = 1.0
+        self.render_traj = True
 
-        # seconds
-        sim_duration = 2.0
-
-        # control frequency
-        fps = 60
-        self.frame_dt = 1.0 / fps
-        frame_steps = int(sim_duration / self.frame_dt)
-
-        # sim frequency
-        self.sim_substeps = 16
-        self.sim_steps = frame_steps * self.sim_substeps
-        self.sim_dt = self.frame_dt / self.sim_substeps
-
-        self.iter = 0
-        self.render_time = 0.0
-
-        self.train_rate = 5.0
-
-        builder = wp.sim.ModelBuilder()
+    def create_modelbuilder(self):
+        builder = super().create_modelbuilder()
         builder.default_particle_radius = 0.01
+        return builder
 
+    def create_env(self, builder):
+        self.create_cloth(builder)
+
+    def create_cloth(self, builder):
         dim_x = 16
         dim_y = 16
 
@@ -94,129 +91,162 @@ class Example:
             tri_drag=5.0,
         )
 
-        self.model = builder.finalize()
-        self.model.ground = False
+    def init_sim(self):
+        super().init_sim()
+        self.print_model_info()
 
-        self.integrator = wp.sim.SemiImplicitIntegrator()
+        with torch.no_grad():
+            self.target = (8.0, 0.0, 0.0)
+            self.target = torch.tensor(self.target, device=self.device)
 
-        self.target = (8.0, 0.0, 0.0)
-        self.com = wp.zeros(1, dtype=wp.vec3, requires_grad=True)
-        self.loss = wp.zeros(1, dtype=wp.float32, requires_grad=True)
-
-        # allocate sim states for trajectory
-        self.states = []
-        for _i in range(self.sim_steps + 1):
-            self.states.append(self.model.state(requires_grad=True))
-
-        if stage_path:
-            self.renderer = wp.sim.render.SimRenderer(self.model, stage_path, scaling=4.0)
+    def reset_idx(self, env_ids):
+        if self.early_termination:
+            raise NotImplementedError
         else:
-            self.renderer = None
+            super().reset_idx(env_ids)
+            self.traj_verts = []
 
-        # capture forward/backward passes
-        self.use_cuda_graph = wp.get_device().is_cuda
-        if self.use_cuda_graph:
-            with wp.ScopedCapture() as capture:
-                self.tape = wp.Tape()
-                with self.tape:
-                    self.forward()
-                self.tape.backward(self.loss)
-            self.graph = capture.graph
+    def randomize_init(self, env_ids):
+        pass
 
-    def forward(self):
-        # run control loop
-        for i in range(self.sim_steps):
-            self.states[i].clear_forces()
+    def pre_physics_step(self, actions):
+        pass
 
-            self.integrator.simulate(self.model, self.states[i], self.states[i + 1], self.sim_dt)
+    def compute_observations(self):
+        particle_q = self.state.particle_q.clone().view(self.num_envs, -1, 3)
+        particle_qd = self.state.particle_qd.clone().view(self.num_envs, -1, 3)
 
-        # compute loss on final state
-        self.com.zero_()
-        wp.launch(
-            com_kernel,
-            dim=self.model.particle_count,
-            inputs=[self.states[-1].particle_q, self.model.particle_count, self.com],
+        particle_q -= self.env_offsets.view(self.num_envs, 1, 3)
+
+        com_q = particle_q.mean(1)
+        delta = com_q - self.target
+
+        self.obs_buf = {
+            "particle_q": particle_q,
+            "particle_qd": particle_qd,
+            "com_q": com_q,
+            "delta": delta,
+        }
+
+    def compute_reward(self):
+        delta = self.obs_buf["delta"]
+        loss = torch.einsum("bi,bi->b", delta, delta)  # dot product
+        rew = -1.0 * loss
+
+        reset_buf, progress_buf = self.reset_buf, self.progress_buf
+        max_episode_steps, early_termination = (
+            self.episode_length,
+            self.early_termination,
         )
-        wp.launch(loss_kernel, dim=1, inputs=[self.com, self.target, self.loss])
+        truncated = progress_buf > max_episode_steps - 1
+        reset = torch.where(truncated, torch.ones_like(reset_buf), reset_buf)
+        if early_termination:
+            raise NotImplementedError
+        else:
+            terminated = torch.where(torch.zeros_like(reset), torch.ones_like(reset), reset)
+        self.rew_buf, self.reset_buf, self.terminated_buf, self.truncated_buf = rew, reset, terminated, truncated
 
-    def step(self):
-        with wp.ScopedTimer("step"):
-            if self.use_cuda_graph:
-                wp.capture_launch(self.graph)
-            else:
-                self.tape = wp.Tape()
-                with self.tape:
-                    self.forward()
-                self.tape.backward(self.loss)
+    def render(self, state=None):
+        if not self.render_traj:
+            super().render(state)
+        else:
+            # render state 1 (swapped with state 0 just before)
+            state = state or self.state_1
+            traj_vert = self.state.particle_q.view(self.num_envs, -1, 3).mean(1).tolist()
+            self.traj_verts.append(traj_vert)
 
-            # gradient descent step
-            x = self.states[0].particle_qd
+            if self.renderer is not None:
+                with wp.ScopedTimer("render", False):
+                    self.render_time += self.frame_dt
+                    self.renderer.begin_frame(self.render_time)
+                    self.renderer.render(state)
 
-            if self.verbose:
-                print(f"Iter: {self.iter} Loss: {self.loss}")
+                    traj_verts = np.array(self.traj_verts).transpose(1, 0, 2)  # -> B, T, 3
+                    for i in range(self.num_envs):
+                        if self.progress_buf[i] == 0:
+                            continue
 
-            wp.launch(step_kernel, dim=len(x), inputs=[x, x.grad, self.train_rate])
+                        pos = (self.target + self.env_offsets[i]).tolist()
+                        self.renderer.render_box(
+                            pos=pos,
+                            rot=wp.quat_identity(),
+                            extents=(0.1, 0.1, 0.1),
+                            color=(1.0, 0.0, 0.0),
+                            name=f"target{i}",
+                        )
 
-            # clear grads for next iteration
-            self.tape.zero()
+                        if traj_verts.shape[1] > 1:
+                            self.renderer.render_line_strip(
+                                vertices=traj_verts[i],
+                                color=wp.render.bourke_color_map(0.0, getattr(self, "max_iter", 64.0), self.iter),
+                                radius=0.02,
+                                name=f"iter{self.iter}_traj{i}",
+                            )
 
-            self.iter = self.iter + 1
+                    self.renderer.end_frame()
 
-    def render(self):
-        if self.renderer is None:
-            return
+    def run(self):
+        self.init()
+        self.initialized = True
 
-        with wp.ScopedTimer("render"):
-            # draw trajectory
-            traj_verts = [self.states[0].particle_q.numpy().mean(axis=0)]
+        state_0 = self.state_0
+        particle_q_0, particle_qd_0 = self.state_tensors
 
-            for i in range(0, self.sim_steps, self.sim_substeps):
-                traj_verts.append(self.states[i].particle_q.numpy().mean(axis=0))
+        train_iters = 64
+        train_rate = 5.0
+        opt = torch.optim.SGD([particle_qd_0], lr=train_rate)
+        opt.add_param_group({"params": [particle_q_0], "lr": 0})  # frozen params, adding so grads are zeroed
 
-                self.renderer.begin_frame(self.render_time)
-                self.renderer.render(self.states[i])
-                self.renderer.render_box(
-                    pos=self.target,
-                    rot=wp.quat_identity(),
-                    extents=(0.1, 0.1, 0.1),
-                    name="target",
-                    color=(1.0, 0.0, 0.0),
-                )
-                self.renderer.render_line_strip(
-                    vertices=traj_verts,
-                    color=wp.render.bourke_color_map(0.0, 269.0, self.loss.numpy()[0]),
-                    radius=0.02,
-                    name=f"traj_{self.iter-1}",
-                )
-                self.renderer.end_frame()
+        self.iter = 0
+        self.max_iter = train_iters
+        while self.iter < self.max_iter:
+            obs = self.reset()
 
-                self.render_time += self.frame_dt
+            self.state_0 = state_0
+            self.state_tensors = [particle_q_0, particle_qd_0]
+            self.render_traj = self.iter % 4 == 0
+
+            profiler = {}
+            with wp.ScopedTimer("episode", detailed=False, print=False, active=True, dict=profiler):
+                obses, actions, rewards, dones, infos = [obs], [], [], [], []
+                for i in range(self.episode_length):
+                    action = torch.rand((self.num_envs, self.num_actions), device=self.device) * 2.0 - 1.0
+                    obs, reward, done, info = self.step(action)
+
+                    obses.append(obs)
+                    actions.append(action)
+                    rewards.append(reward)
+                    dones.append(done)
+                    infos.append(info)
+
+                loss = -rewards[-1]
+
+                opt.zero_grad()
+                loss.sum().backward()
+                opt.step()
+
+                print(f"Iter: {self.iter} Loss: {loss.tolist()}")
+                print(f"Grad particle q, qd: {particle_q_0.grad.norm().item()}, {particle_qd_0.grad.norm().item()}")
+
+            avg_time = np.array(profiler["episode"]).mean() / self.episode_length
+            avg_steps_second = 1000.0 * float(self.num_envs) / avg_time
+            total_time_second = np.array(profiler["episode"]).sum() / 1000.0
+
+            print(
+                f"num_envs: {self.num_envs} |",
+                f"steps/second: {avg_steps_second:.4} |",
+                f"milliseconds/step: {avg_time:.4f} |",
+                f"total_seconds: {total_time_second:.4f} |",
+            )
+            print()
+
+            self.iter += 1
+
+        if self.renderer is not None:
+            self.renderer.save()
+
+        return 1000.0 * float(self.num_envs) / avg_time
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument(
-        "--stage_path",
-        type=lambda x: None if x == "None" else str(x),
-        default="example_cloth_throw.usd",
-        help="Path to the output USD file.",
-    )
-    parser.add_argument("--train_iters", type=int, default=64, help="Total number of training iterations.")
-    parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
-
-    args = parser.parse_known_args()[0]
-
-    with wp.ScopedDevice(args.device):
-        example = Example(stage_path=args.stage_path, verbose=args.verbose)
-
-        # replay and optimize
-        for i in range(args.train_iters):
-            example.step()
-            if i % 4 == 0:
-                example.render()
-
-        if example.renderer:
-            example.renderer.save()
+    run_env(ClothThrow, no_grad=False)
