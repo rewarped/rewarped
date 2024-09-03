@@ -15,20 +15,45 @@
 #
 ###########################################################################
 
+import torch
+
 import warp as wp
-import warp.sim
-import warp.sim.render
+
+from ...environment import IntegratorType, run_env
+from ...warp_env import WarpEnv
 
 
-class Example:
-    def __init__(self, stage_path="example_rigid_gyroscopic.usd"):
-        fps = 120
-        self.sim_dt = 1.0 / fps
-        self.sim_time = 0.0
+class RigidGyroscopic(WarpEnv):
+    sim_name = "RigidGyroscopic" + "WarpExamples"
+    env_offset = (1.0, 1.0, 0.0)
 
+    eval_fk = True
+    eval_ik = False
+
+    integrator_type = IntegratorType.EULER
+    sim_substeps_euler = 1
+    euler_settings = dict(angular_damping=0.05)
+
+    # integrator_type = IntegratorType.FEATHERSTONE
+    # sim_substeps_featherstone = 1
+    # featherstone_settings = dict(angular_damping=0.05, update_mass_matrix_every=sim_substeps_featherstone)
+
+    frame_dt = 1.0 / 120.0
+
+    up_axis = "Z"
+    ground_plane = False
+    gravity = 0.0
+
+    def __init__(self, num_envs=8, episode_length=2000, early_termination=False, **kwargs):
+        num_obs = 0
+        num_act = 0
+        super().__init__(num_envs, num_obs, num_act, episode_length, early_termination, **kwargs)
+
+    def create_env(self, builder):
+        self.create_articulation(builder)
+
+    def create_articulation(self, builder):
         self.scale = 0.5
-
-        builder = wp.sim.ModelBuilder()
 
         b = builder.add_body()
 
@@ -55,55 +80,38 @@ class Example:
         # initial spin
         builder.body_qd[0] = (25.0, 0.01, 0.01, 0.0, 0.0, 0.0)
 
-        builder.gravity = 0.0
-        self.model = builder.finalize()
-        self.model.ground = False
+    def init_sim(self):
+        super().init_sim()
+        # self.print_model_info()
 
-        self.integrator = wp.sim.SemiImplicitIntegrator()
-        self.state = self.model.state()
-
-        if stage_path:
-            self.renderer = wp.sim.render.SimRenderer(self.model, stage_path, scaling=100.0)
+    def reset_idx(self, env_ids):
+        if self.early_termination:
+            raise NotImplementedError
         else:
-            self.renderer = None
+            super().reset_idx(env_ids)
 
-    def step(self):
-        with wp.ScopedTimer("step"):
-            self.state.clear_forces()
-            self.state = self.integrator.simulate(self.model, self.state, self.state, self.sim_dt)
-            self.sim_time += self.sim_dt
+    def randomize_init(self, env_ids):
+        pass
 
-    def render(self):
-        if self.renderer is None:
-            return
+    def pre_physics_step(self, actions):
+        pass
 
-        with wp.ScopedTimer("render"):
-            self.renderer.begin_frame(self.sim_time)
-            self.renderer.render(self.state)
-            self.renderer.end_frame()
+    def compute_observations(self):
+        self.obs_buf = {}
+
+    def compute_reward(self):
+        rew = 0.0
+
+        reset_buf, progress_buf = self.reset_buf, self.progress_buf
+        max_episode_steps, early_termination = self.episode_length, self.early_termination
+        truncated = progress_buf > max_episode_steps - 1
+        reset = torch.where(truncated, torch.ones_like(reset_buf), reset_buf)
+        if early_termination:
+            raise NotImplementedError
+        else:
+            terminated = torch.where(torch.zeros_like(reset), torch.ones_like(reset), reset)
+        self.rew_buf, self.reset_buf, self.terminated_buf, self.truncated_buf = rew, reset, terminated, truncated
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument(
-        "--stage_path",
-        type=lambda x: None if x == "None" else str(x),
-        default="example_rigid_gyroscopic.usd",
-        help="Path to the output USD file.",
-    )
-    parser.add_argument("--num_frames", type=int, default=2000, help="Total number of frames.")
-
-    args = parser.parse_known_args()[0]
-
-    with wp.ScopedDevice(args.device):
-        example = Example(stage_path=args.stage_path)
-
-        for _ in range(args.num_frames):
-            example.step()
-            example.render()
-
-        if example.renderer:
-            example.renderer.save()
+    run_env(RigidGyroscopic)
