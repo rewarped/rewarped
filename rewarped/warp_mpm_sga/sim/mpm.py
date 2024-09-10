@@ -217,7 +217,6 @@ class MPMConstant(object):
 
     body_friction: float
     body_softness: float
-
     ground_friction: float
 
     lower_lim: wp.vec3
@@ -550,8 +549,9 @@ class MPMModel(Model):
             if py < constant.bound and v[1] < 0.0:
                 lin = v[1]
                 v = wp.vec3(v[0], 0.0, v[2])
+                # TODO: ground friction assumes up_axis='y'
                 if constant.ground_friction > 0.0:
-                    v = v * wp.max(1. + constant.ground_friction * lin / wp.length(v), 0.)
+                    v = v * wp.max(1.0 + constant.ground_friction * lin / wp.length(v), 0.0)
             if pz < constant.bound and v[2] < 0.0:
                 v = wp.vec3(v[0], v[1], 0.0)
             if px > constant.num_grids - constant.bound and v[0] > 0.0:
@@ -560,8 +560,6 @@ class MPMModel(Model):
                 v = wp.vec3(v[0], 0.0, v[2])
             if pz > constant.num_grids - constant.bound and v[2] > 0.0:
                 v = wp.vec3(v[0], v[1], 0.0)
-
-            # TODO: ground_friction
 
         grid.v[env, px, py, pz] = v
 
@@ -800,7 +798,6 @@ class MPMModelBuilder(ModelBuilder):
 
         body_friction: float = cfg['body_friction']
         body_softness: float = cfg['body_softness']
-
         ground_friction: float = cfg['ground_friction']
 
         self.config['num_grids'] = num_grids
@@ -820,7 +817,6 @@ class MPMModelBuilder(ModelBuilder):
 
         self.config['body_friction'] = body_friction
         self.config['body_softness'] = body_softness
-
         self.config['ground_friction'] = ground_friction
 
         return self
@@ -844,7 +840,6 @@ class MPMModelBuilder(ModelBuilder):
 
         constant.body_friction = self.config['body_friction']
         constant.body_softness = self.config['body_softness']
-
         constant.ground_friction = self.config['ground_friction']
 
         return constant

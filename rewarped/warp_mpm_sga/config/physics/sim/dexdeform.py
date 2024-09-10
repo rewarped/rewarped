@@ -18,5 +18,4 @@ class DexDeformSimConfig(BaseSimConfig, name='dexdeform'):
 
     body_friction: float = 0.5
     body_softness: float = 666.
-
     ground_friction: float = 500.
