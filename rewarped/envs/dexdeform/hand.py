@@ -152,6 +152,7 @@ class Hand(MPMWarpEnvMixin, WarpEnv):
         gravity = np.array(self.dexdeform_cfg.SIMULATOR.gravity) * 30
         mpm_cfg.update(["--physics.sim.gravity", str(tuple(gravity))])
         mpm_cfg.update(["--physics.sim.body_friction", str(self.dexdeform_cfg.SIMULATOR.hand_friction)])
+        mpm_cfg.update(["--physics.sim.ground_friction", str(self.dexdeform_cfg.SIMULATOR.ground_friction)])
 
         def update_plasticine_params():
             E, nu = self.dexdeform_cfg.SIMULATOR.E, self.dexdeform_cfg.SIMULATOR.nu

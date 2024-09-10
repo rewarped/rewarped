@@ -18,3 +18,5 @@ class LowSimConfig(BaseSimConfig, name='low'):
 
     body_friction: float = 0.0
     body_softness: float = 0.0
+
+    ground_friction: float = 500.
