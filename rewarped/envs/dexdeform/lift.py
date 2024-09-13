@@ -5,8 +5,8 @@ from .hand import Hand
 class Lift(Hand):
     sim_name = "Lift" + "DexDeform"
 
-    TRAJ_OPT = True
-    LOAD_DEMO = False
+    RUN_LOAD_DEMO = False
+    RUN_TRAJ_OPT = True
 
     def __init__(self, task_name="lift", **kwargs):
         super().__init__(task_name=task_name, **kwargs)
