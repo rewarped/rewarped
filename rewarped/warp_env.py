@@ -554,41 +554,63 @@ class WarpEnv(Environment):
     def compute_reward(self):
         raise NotImplementedError
 
-    def run(self, N=2):
-        # return super().run()
+    def run_cfg(self):
+        iters = 2
+        opt = None
+        policy = None
+        return iters, opt, policy
 
-        # torch.autograd.set_detect_anomaly(True)
+    def run_reset(self):
+        obs = self.reset(clear_grad=self.requires_grad)
+        return obs
 
-        for n in range(N):
-            obs = self.reset()
+    def run_loss(self, traj, opt, policy):
+        if not self.requires_grad:
+            return
+        obses, actions, rewards, dones, infos = traj
+
+        # maximize rewards summed over time
+        loss = -torch.stack(rewards).sum(0)
+
+        opt.zero_grad()
+        loss.sum().backward()
+        opt.step()
+
+        grad_norm = [x.grad.norm() for x in actions]
+        grad_norm = torch.stack(grad_norm).mean()
+        actions = torch.stack(actions)
+
+        print(f"Iter: {self.iter} Loss: {loss.tolist()}")
+        print(f"Grads: {grad_norm.item()}")
+        print(
+            "Actions:",
+            actions.mean().item(),
+            actions.std().item(),
+            actions.min().item(),
+            actions.max().item(),
+        )
+
+    def run(self):
+        self.init()
+        self.initialized = True
+
+        iters, opt, policy = self.run_cfg()
+
+        self.iter, self.max_iter = 0, iters
+        avg_times = []
+        while self.iter < self.max_iter:
+            init_obs = self.run_reset()
 
             profiler = {}
             with wp.ScopedTimer("episode", detailed=False, print=False, active=True, dict=profiler):
-                obses, actions, rewards, dones, infos = [obs], [], [], [], []
-                for i in range(self.episode_length):
-                    action_shape = (self.num_envs, self.num_actions)
-                    action = torch.randn(action_shape, device=self.device, requires_grad=self.requires_grad) * 2.0 - 1.0
-                    # action[...] = 1.0
-                    obs, reward, done, info = self.step(action)
-
-                    print(i, "/", self.episode_length)
-                    # print("action:", action.detach().cpu().numpy().flatten())
-
-                    obses.append(obs)
-                    actions.append(action)
-                    rewards.append(reward)
-                    dones.append(done)
-                    infos.append(info)
-
-                if self.synchronize:
-                    wp.synchronize_device()
-
-                # loss = -torch.stack(rewards).sum()
-                # loss.backward()
+                traj = self.run_episode(init_obs, policy)
+                if opt is not None:
+                    self.run_loss(traj, opt, policy)
 
             avg_time = np.array(profiler["episode"]).mean() / self.episode_length
             avg_steps_second = 1000.0 * float(self.num_envs) / avg_time
             total_time_second = np.array(profiler["episode"]).sum() / 1000.0
+            avg_times.append(avg_time)
 
             print(
                 f"num_envs: {self.num_envs} |",
@@ -596,8 +618,43 @@ class WarpEnv(Environment):
                 f"milliseconds/step: {avg_time:.4f} |",
                 f"total_seconds: {total_time_second:.4f} |",
             )
+            print()
+
+            self.iter += 1
 
         if self.renderer is not None:
             self.renderer.save()
 
-        return 1000.0 * float(self.num_envs) / avg_time
+        return 1000.0 * float(self.num_envs) / np.mean(avg_times)
+
+    def run_episode(self, obs, policy=None):
+        obses, actions, rewards, dones, infos = [obs], [], [], [], []
+        for i in range(self.episode_length):
+            if policy is None:
+                # random actions
+                action_shape = (self.num_envs, self.num_actions)
+                action = torch.randn(action_shape, device=self.device, requires_grad=self.requires_grad) * 2.0 - 1.0
+                # action[...] = 1.0
+            elif callable(policy):
+                action = policy(i, obs)
+            elif isinstance(policy, list):
+                action = policy[i]
+            else:
+                raise RuntimeError
+
+            obs, reward, done, info = self.step(action)
+
+            if not self.requires_grad:
+                print(i, "/", self.episode_length)
+
+            obses.append(obs)
+            actions.append(action)
+            rewards.append(reward)
+            dones.append(done)
+            infos.append(info)
+
+        if self.synchronize:
+            wp.synchronize_device()
+
+        traj = obses, actions, rewards, dones, infos
+        return traj
