@@ -180,9 +180,8 @@ class Bounce(WarpEnv):
     def check_grad(self):
         raise NotImplementedError
 
-    def run(self):
-        self.init()
-        self.initialized = True
+    def run_cfg(self):
+        assert self.requires_grad
 
         state_0 = self.state_0
         particle_q_0, particle_qd_0 = self.state_tensors
@@ -192,55 +191,38 @@ class Bounce(WarpEnv):
         opt = torch.optim.SGD([particle_qd_0], lr=train_rate)
         opt.add_param_group({"params": [particle_q_0], "lr": 0})  # frozen params, adding so grads are zeroed
 
-        self.iter = 0
-        self.max_iter = train_iters
-        while self.iter < self.max_iter:
-            obs = self.reset(clear_grad=True)
+        self._run_state = state_0
+        self._run_state_tensors = (particle_q_0, particle_qd_0)
 
-            self.state_0 = state_0
-            self.state_tensors = [particle_q_0, particle_qd_0]
-            self.render_traj = self.iter % 16 == 0
+        policy = None
 
-            profiler = {}
-            with wp.ScopedTimer("episode", detailed=False, print=False, active=True, dict=profiler):
-                obses, actions, rewards, dones, infos = [obs], [], [], [], []
-                for i in range(self.episode_length):
-                    action = torch.rand((self.num_envs, self.num_actions), device=self.device) * 2.0 - 1.0
-                    obs, reward, done, info = self.step(action)
+        return train_iters, opt, policy
 
-                    obses.append(obs)
-                    actions.append(action)
-                    rewards.append(reward)
-                    dones.append(done)
-                    infos.append(info)
+    def run_reset(self):
+        obs = self.reset(clear_grad=self.requires_grad)
 
-                loss = -rewards[-1]
+        state_0 = self._run_state
+        particle_q_0, particle_qd_0 = self._run_state_tensors
 
-                opt.zero_grad()
-                loss.sum().backward()
-                opt.step()
+        self.state_0 = state_0
+        self.state_tensors = [particle_q_0, particle_qd_0]
+        self.render_traj = self.iter % 16 == 0
 
-                print(f"Iter: {self.iter} Loss: {loss.tolist()}")
-                print(f"Grad particle q, qd: {particle_q_0.grad.norm().item()}, {particle_qd_0.grad.norm().item()}")
+        return obs
 
-            avg_time = np.array(profiler["episode"]).mean() / self.episode_length
-            avg_steps_second = 1000.0 * float(self.num_envs) / avg_time
-            total_time_second = np.array(profiler["episode"]).sum() / 1000.0
+    def run_loss(self, traj, opt, policy):
+        obses, actions, rewards, dones, infos = traj
 
-            print(
-                f"num_envs: {self.num_envs} |",
-                f"steps/second: {avg_steps_second:.4} |",
-                f"milliseconds/step: {avg_time:.4f} |",
-                f"total_seconds: {total_time_second:.4f} |",
-            )
-            print()
+        loss = -rewards[-1]
 
-            self.iter += 1
+        opt.zero_grad()
+        loss.sum().backward()
+        opt.step()
 
-        if self.renderer is not None:
-            self.renderer.save()
+        particle_q_0, particle_qd_0 = self._run_state_tensors
 
-        return 1000.0 * float(self.num_envs) / avg_time
+        print(f"Iter: {self.iter} Loss: {loss.tolist()}")
+        print(f"Grad particle q, qd: {particle_q_0.grad.norm().item()}, {particle_qd_0.grad.norm().item()}")
 
 
 if __name__ == "__main__":

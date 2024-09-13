@@ -239,7 +239,9 @@ class Walker(WarpEnv):
             terminated = torch.where(torch.zeros_like(reset), torch.ones_like(reset), reset)
         self.rew_buf, self.reset_buf, self.terminated_buf, self.truncated_buf = rew, reset, terminated, truncated
 
-    def run(self):
+    def run_cfg(self):
+        assert self.requires_grad
+
         train_iters = 30
         train_rate = 0.025
 
@@ -268,79 +270,55 @@ class Walker(WarpEnv):
         # nn.init.uniform_(weights, -np.sqrt(k), np.sqrt(k))
         nn.init.zeros_(bias)
 
+        self._run_weights = weights
+
         net.to(self.device)
         net.train()
         opt = torch.optim.Adam(net.parameters(), lr=train_rate)
         print(net)
 
-        for iter in range(train_iters):
-            obs = self.reset(clear_grad=True)
-
-            profiler = {}
-            with wp.ScopedTimer("episode", detailed=False, print=False, active=True, dict=profiler):
-                obses, actions, rewards, dones, infos = [obs], [], [], [], []
-                for i in range(self.episode_length):
-                    sim_time = i * self.frame_dt
-                    phase_counts = torch.arange(
-                        phase_count,
-                        dtype=torch.float,
-                        device=self.device,
-                        requires_grad=True,
-                    )
-                    phases[i] = torch.sin(phase_freq * sim_time + phase_counts * phase_step)
-                    phases[i] = phases[i].repeat(self.num_envs, 1)
-                    action = net(phases[i])
-
-                    obs, reward, done, info = self.step(action)
-
-                    obses.append(obs)
-                    actions.append(action)
-                    rewards.append(reward)
-                    dones.append(done)
-                    infos.append(info)
-
-                actions = torch.stack(actions)
-                rewards = torch.stack(rewards)
-
-                # loss = torch.stack([obs["loss"] for obs in obses[1:]])  # skip the first observation
-                # loss = loss.sum(0)  # sum over time
-                # # loss /= self.num_envs
-
-                loss = -rewards.sum(0)
-
-                # Optimization step
-                opt.zero_grad()
-                loss.sum().backward()
-                opt.step()
-
-                grad_norm = weights.grad.norm()
-
-                print(f"Iter: {iter} Loss: {loss.tolist()}")
-                print(f"Grad W: {grad_norm.item()}")
-                print(
-                    "Traj actions:",
-                    actions.mean().item(),
-                    actions.std().item(),
-                    actions.min().item(),
-                    actions.max().item(),
-                )
-
-            avg_time = np.array(profiler["episode"]).mean() / self.episode_length
-            avg_steps_second = 1000.0 * float(self.num_envs) / avg_time
-            total_time_second = np.array(profiler["episode"]).sum() / 1000.0
-
-            print(
-                f"num_envs: {self.num_envs} |",
-                f"steps/second: {avg_steps_second:.4} |",
-                f"milliseconds/step: {avg_time:.4f} |",
-                f"total_seconds: {total_time_second:.4f} |",
+        def policy_fn(i, obs):
+            sim_time = i * self.frame_dt
+            phase_counts = torch.arange(
+                phase_count,
+                dtype=torch.float,
+                device=self.device,
+                requires_grad=True,
             )
-            print()
+            phases[i] = torch.sin(phase_freq * sim_time + phase_counts * phase_step)
+            phases[i] = phases[i].repeat(self.num_envs, 1)
+            action = net(phases[i])
+            return action
 
-        if self.renderer is not None:
-            self.renderer.save()
+        return train_iters, opt, policy_fn
 
-        return 1000.0 * float(self.num_envs) / avg_time
+    def run_loss(self, traj, opt, policy):
+        obses, actions, rewards, dones, infos = traj
+
+        # loss = torch.stack([obs["loss"] for obs in obses[1:]])  # skip the first observation
+        # loss = loss.sum(0)  # sum over time
+        # # loss /= self.num_envs
+
+        loss = -torch.stack(rewards).sum(0)
+
+        # Optimization step
+        opt.zero_grad()
+        loss.sum().backward()
+        opt.step()
+
+        weights = self._run_weights
+        grad_norm = weights.grad.norm()
+        actions = torch.stack(actions)
+
+        print(f"Iter: {self.iter} Loss: {loss.tolist()}")
+        print(f"Grad W: {grad_norm.item()}")
+        print(
+            "Actions:",
+            actions.mean().item(),
+            actions.std().item(),
+            actions.min().item(),
+            actions.max().item(),
+        )
 
 
 if __name__ == "__main__":
