@@ -7,4 +7,4 @@ class CylinderDexDeformShapeConfig(BaseShapeConfig, name='cylinder_dexdeform'):
     size: tuple[float, float, float] = (0.003, 0.1, 0.0)
     num_particles: int = 10000
     vol: float = (1. / 64 / 2) ** 2
-    mode: str = 'random'
+    mode: str = 'symmetric'

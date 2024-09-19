@@ -1060,6 +1060,23 @@ class MPMInitData(object):
                     sdf_func=sdf_func,
                     rng=rng,
                 )
+            elif mode == 'symmetric':
+                rng = np.random.Generator(np.random.PCG64(0))
+
+                sdf_func = shapes.compute_half_cylinder_sdf(h=h, r=r)
+                sample_func = shapes.box_particles(np.array([r, h, r]))
+
+                p_x = shapes.rejection_sampling(
+                    init_pos=np.array([0., 0., 0.]),
+                    n_particles=num_particles // 2,
+                    sample_func=sample_func,
+                    sdf_func=sdf_func,
+                    rng=rng,
+                )
+
+                p_x_mirror = p_x * np.array([-1, 1, 1])
+
+                p_x = np.stack([p_x, p_x_mirror], axis=0)
             else:
                 raise ValueError('invalid mode: {}'.format(mode))
 

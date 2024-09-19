@@ -215,7 +215,6 @@ class Hand(MPMWarpEnvMixin, WarpEnv):
                 cylinder_indices = torch.arange(0, self.downsample_particle, device=self.device)
                 N = self.downsample_particle // 2
                 self.half0_indices, self.half1_indices = cylinder_indices[:N], cylinder_indices[N:]
-                self.half1_indices = torch.flip(self.half1_indices, [0])
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)

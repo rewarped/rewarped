@@ -19,6 +19,22 @@ def compute_cylinder_sdf(h, r):
 
     return sdf_func
 
+def compute_half_cylinder_sdf(h, r):
+    def sdf_func(p):
+        x, y, z = p[:, 0], p[:, 1], p[:, 2]
+        vec_xz = np.stack([x, z], axis=1)
+
+        rh = np.array([[r, h]])
+        d = np.abs(np.stack([length(vec_xz), y], axis=1)) - rh
+
+        half = x >= 0
+
+        d[~half, 0] = length(np.stack([x[~half], np.maximum(z[~half] - r, 0)], axis=1))
+
+        return np.minimum(np.maximum(d[:, 0], d[:, 1]), 0.0) + length(np.maximum(d, 0.0))
+
+    return sdf_func
+
 
 def box_particles(width):
     def sample_func(n_particles, rng):
