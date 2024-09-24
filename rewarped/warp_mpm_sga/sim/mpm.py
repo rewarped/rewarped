@@ -25,6 +25,10 @@ from . import shapes
 def normalize_transform(t: wp.transform):
     return wp.transform(wp.transform_get_translation(t), wp.normalize(wp.transform_get_rotation(t)))
 
+@wp.func
+def transform_point_inv(t: wp.transform, point: wp.vec3):
+    return wp.quat_rotate_inv(wp.transform_get_rotation(t), point - wp.transform_get_translation(t))
+
 @wp.struct
 class MPMStatics(Statics):
 
@@ -607,7 +611,7 @@ class MPMModel(Model):
             X_ws_next = normalize_transform(wp.transform_multiply(X_wb_next, X_bs))
 
             # transform particle position to shape local space
-            x_local = wp.transform_point(wp.transform_inverse(X_ws), gx)
+            x_local = transform_point_inv(X_ws, gx)
 
             # geo description
             geo_type = body_geo.type[shape_index]
