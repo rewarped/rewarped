@@ -554,7 +554,10 @@ class MPMModel(Model):
             up_v = v[1]
             hit_ground = py < constant.bound and up_v < 0.0
             if constant.ground_friction > 0.0 and hit_ground:
-                v = v * wp.max(1.0 + constant.ground_friction * up_v / (wp.length(v) + 1e-30), 0.0)
+                if constant.ground_friction < 99.:
+                    v = v * wp.max(1.0 + constant.ground_friction * up_v / (wp.length(v) + 1e-30), 0.0)
+                else:
+                    v = wp.vec3(0.0) 
 
             # boundary condition
             if px < constant.bound and v[0] < 0.0:
