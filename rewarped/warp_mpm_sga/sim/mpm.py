@@ -21,13 +21,20 @@ from .base import Statics, State, Model, ModelBuilder, StateInitializer, Statics
 from . import materials
 from . import shapes
 
+
 @wp.func
 def normalize_transform(t: wp.transform):
-    return wp.transform(wp.transform_get_translation(t), wp.normalize(wp.transform_get_rotation(t)))
+    p = wp.transform_get_translation(t)
+    q = wp.transform_get_rotation(t)
+    return wp.transform(p, wp.normalize(q))
+
 
 @wp.func
 def transform_point_inv(t: wp.transform, point: wp.vec3):
-    return wp.quat_rotate_inv(wp.transform_get_rotation(t), point - wp.transform_get_translation(t))
+    p = wp.transform_get_translation(t)
+    q = wp.transform_get_rotation(t)
+    return wp.quat_rotate_inv(q, point - p)
+
 
 @wp.struct
 class MPMStatics(Statics):
@@ -610,6 +617,7 @@ class MPMModel(Model):
 
             X_bs = shape_X_bs[shape_index]
 
+            # normalize quaternion to deal with numerical errors
             X_ws = normalize_transform(wp.transform_multiply(X_wb, X_bs))
             X_ws_next = normalize_transform(wp.transform_multiply(X_wb_next, X_bs))
 
