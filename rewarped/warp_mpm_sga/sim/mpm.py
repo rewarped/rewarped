@@ -21,6 +21,9 @@ from .base import Statics, State, Model, ModelBuilder, StateInitializer, Statics
 from . import materials
 from . import shapes
 
+@wp.func
+def normalize_transform(t: wp.transform):
+    return wp.transform(wp.transform_get_translation(t), wp.normalize(wp.transform_get_rotation(t)))
 
 @wp.struct
 class MPMStatics(Statics):
@@ -600,11 +603,11 @@ class MPMModel(Model):
 
             X_bs = shape_X_bs[shape_index]
 
-            X_ws = wp.transform_multiply(X_wb, X_bs)
-            X_sw = wp.transform_inverse(X_ws)
+            X_ws = normalize_transform(wp.transform_multiply(X_wb, X_bs))
+            X_ws_next = normalize_transform(wp.transform_multiply(X_wb_next, X_bs))
 
             # transform particle position to shape local space
-            x_local = wp.transform_point(X_sw, gx)
+            x_local = wp.transform_point(wp.transform_inverse(X_ws), gx)
 
             # geo description
             geo_type = body_geo.type[shape_index]
@@ -658,7 +661,7 @@ class MPMModel(Model):
             influence = wp.min(wp.exp(-dist * softness), 1.)
 
             if (influence > 0.1) or (dist <= 0):
-                bv = (wp.transform_point(X_wb_next, wp.transform_point(X_bs, x_local)) - gx) / constant.dt
+                bv = (wp.transform_point(X_ws_next, x_local) - gx) / constant.dt
                 rel_v = v - bv
 
                 normal_component = wp.dot(rel_v, normal)
