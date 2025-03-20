@@ -7,6 +7,7 @@ import warp as wp
 from .autograd import UpdateFunction
 from .environment import Environment, RenderMode
 from .warp.model_monkeypatch import Model_control, Model_state
+from .sensors.camera import Camera
 
 
 @torch.jit.script
@@ -130,6 +131,7 @@ class WarpEnv(Environment):
         synchronize=False,
         max_unroll=16,
         debug=False,
+        obs_mode="state",
     ):
         super().__init__()
         # Environment parameters
@@ -187,6 +189,15 @@ class WarpEnv(Environment):
         self.act_space = spaces.Box(np.ones(self.num_act) * -1.0, np.ones(self.num_act) * 1.0)
 
         self.scatter_actions = staticmethod(scatter_clone)  # alias for convenience
+        
+        # Sensor configs
+        self.obs_mode = obs_mode
+        self.sensors = {}
+        self.camera_enabled = False
+        
+        # Add a default camera if using visual observations
+        if obs_mode in ["rgb", "depth", "rgbd", "visual"]:
+            self.camera_enabled = True
 
     @property
     def num_observations(self):
@@ -230,6 +241,71 @@ class WarpEnv(Environment):
         super().init()
         self.allocate_buffers()
         self.init_sim()
+        
+        # Initialize sensors
+        self.setup_sensors()
+        
+    def add_camera(self, name, position, target, up=[0, 0, 1], width=84, height=84, fov=60.0):
+        """Add a camera sensor to the environment."""
+        self.sensors[name] = Camera(name, position, target, up, width, height, fov)
+        return self.sensors[name]
+    
+    def setup_sensors(self):
+        """Initialize sensors based on observation mode."""
+        # If camera-based observations are enabled but no cameras defined, add a default one
+        if self.camera_enabled and not self.sensors:
+            self.add_camera("main_camera", [2.0, 2.0, 2.0], [0.0, 0.0, 0.0])
+        
+        # Call setup for all sensors
+        for name, sensor in self.sensors.items():
+            sensor.setup()
+            
+    def update_render(self):
+        """Update the rendering state and capture data from all sensors.
+        This should be called before get_sensor_obs() to ensure sensor data is updated."""
+        # Call render to update the visual state 
+        self.render()
+        
+        # Capture data from all sensors
+        for name, sensor in self.sensors.items():
+            sensor.capture(self.model)
+    
+    def get_sensor_obs(self):
+        """Get all sensor data as observations."""
+        sensor_data = {}
+        for name, sensor in self.sensors.items():
+            if self.obs_mode == "rgb":
+                sensor_data[name] = sensor.get_obs(rgb=True, depth=False, segmentation=False)
+            elif self.obs_mode == "depth":
+                sensor_data[name] = sensor.get_obs(rgb=False, depth=True, segmentation=False)
+            elif self.obs_mode == "rgbd":
+                sensor_data[name] = sensor.get_obs(rgb=True, depth=True, segmentation=False)
+            elif self.obs_mode == "visual":
+                sensor_data[name] = sensor.get_obs(rgb=True, depth=True, segmentation=True)
+        
+        # If there's only one sensor, don't nest the observation
+        if len(sensor_data) == 1:
+            sensor_data = next(iter(sensor_data.values()))
+            
+        return sensor_data
+        
+    def _get_state_obs(self):
+        """Get state-based observations (must be implemented by subclasses)."""
+        raise NotImplementedError("Subclasses must implement _get_state_obs")
+    
+    def get_obs(self):
+        """Get observations based on the observation mode."""
+        if self.obs_mode == "state":
+            return self._get_state_obs()
+        
+        elif self.obs_mode in ["rgb", "depth", "rgbd", "visual"]:
+            # First make sure sensors have the latest data
+            # This isn't strictly necessary if update_render is called during step()
+            # but we'll keep it for safety
+            self.update_render()
+            
+            # Then get the observations from all sensors
+            return self.get_sensor_obs()
 
     def allocate_buffers(self):
         # Allocate buffers
@@ -461,6 +537,11 @@ class WarpEnv(Environment):
         self.num_frames += 1
         self.reset_buf = torch.zeros_like(self.reset_buf)
 
+        # Update rendering and sensors
+        with wp.ScopedTimer("render", active=False, detailed=False):
+            if self.camera_enabled or self.obs_mode in ["rgb", "depth", "rgbd", "visual"]:
+                self.update_render()
+
         # post_physics_step()
         self.compute_observations()
         self.compute_reward()
@@ -481,9 +562,9 @@ class WarpEnv(Environment):
             with wp.ScopedTimer("reset", active=False, detailed=False):
                 self.reset(env_ids)
 
-        # NOTE: this occurs post reset, so will render initial state (not terminal state)
-        with wp.ScopedTimer("render", active=False, detailed=False):
-            self.render()
+        # Save renderer output if needed
+        if self.renderer is not None:
+            self.renderer.save()
 
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
@@ -553,7 +634,8 @@ class WarpEnv(Environment):
         raise NotImplementedError
 
     def compute_observations(self):
-        raise NotImplementedError
+        """Compute observations for the current timestep."""
+        self.obs_buf = self.get_obs()
 
     def compute_reward(self):
         raise NotImplementedError

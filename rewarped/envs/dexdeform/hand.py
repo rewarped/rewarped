@@ -46,12 +46,12 @@ class Hand(MPMWarpEnvMixin, WarpEnv):
     RUN_LOAD_DEMO = False
     RUN_TRAJ_OPT = True
 
-    def __init__(self, task_name="flip", num_envs=2, episode_length=-1, early_termination=False, **kwargs):
+    def __init__(self, task_name="flip", num_envs=2, episode_length=-1, early_termination=False, obs_mode="state", **kwargs):
         num_obs = 0
         num_act = 24
         if episode_length == -1:
             episode_length = TASK_LENGTHS[task_name]
-        super().__init__(num_envs, num_obs, num_act, episode_length, early_termination, **kwargs)
+        super().__init__(num_envs, num_obs, num_act, episode_length, early_termination, obs_mode=obs_mode, **kwargs)
 
         self.task_name = task_name
         self.action_scale = (0.33 * 0.002) * self.sim_substeps_mpm
@@ -59,16 +59,105 @@ class Hand(MPMWarpEnvMixin, WarpEnv):
 
         self.dexdeform_cfg = self.create_cfg_dexdeform()
         print(self.dexdeform_cfg)
+        
+        # Set up cameras if visual observations are enabled
+        if self.camera_enabled:
+            # Camera above looking down
+            self.add_camera("top_camera", 
+                            position=[0.0, 0.5, 0.0], 
+                            target=[0.0, 0.0, 0.0], 
+                            up=[0.0, 0.0, 1.0],
+                            width=128, 
+                            height=128)
+            
+            # Side view cameras 
+            self.add_camera("side_camera_1", 
+                           position=[0.3, 0.2, 0.0], 
+                           target=[0.0, 0.0, 0.0], 
+                           up=[0.0, 1.0, 0.0],
+                           width=128, 
+                           height=128)
 
     @property
     def observation_space(self):
-        d = {
-            "particle_q": spaces.Box(low=-np.inf, high=np.inf, shape=(self.downsample_particle, 3), dtype=np.float32),
-            "com_q": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "joint_q": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_act,), dtype=np.float32),
-        }
-        d = spaces.Dict(d)
-        return d
+        if self.obs_mode == "state":
+            d = {
+                "particle_q": spaces.Box(low=-np.inf, high=np.inf, shape=(self.downsample_particle, 3), dtype=np.float32),
+                "com_q": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+                "joint_q": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_act,), dtype=np.float32),
+            }
+            d = spaces.Dict(d)
+            return d
+        
+        elif self.obs_mode == "rgb":
+            # Just return RGB images from cameras
+            if len(self.sensors) == 1:
+                # Single camera
+                sensor_name = next(iter(self.sensors.keys()))
+                sensor = self.sensors[sensor_name]
+                return spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width, 3), dtype=np.uint8)
+            else:
+                # Multiple cameras
+                d = {}
+                for name, sensor in self.sensors.items():
+                    d[name] = spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width, 3), dtype=np.uint8)
+                return spaces.Dict(d)
+                
+        elif self.obs_mode == "depth":
+            # Just return depth images from cameras
+            if len(self.sensors) == 1:
+                # Single camera
+                sensor_name = next(iter(self.sensors.keys()))
+                sensor = self.sensors[sensor_name]
+                return spaces.Box(low=0, high=1, shape=(sensor.height, sensor.width), dtype=np.float32)
+            else:
+                # Multiple cameras
+                d = {}
+                for name, sensor in self.sensors.items():
+                    d[name] = spaces.Box(low=0, high=1, shape=(sensor.height, sensor.width), dtype=np.float32)
+                return spaces.Dict(d)
+                
+        elif self.obs_mode == "rgbd":
+            # Return RGB and depth images from cameras
+            if len(self.sensors) == 1:
+                # Single camera
+                sensor_name = next(iter(self.sensors.keys()))
+                sensor = self.sensors[sensor_name]
+                return spaces.Dict({
+                    "rgb": spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width, 3), dtype=np.uint8),
+                    "depth": spaces.Box(low=0, high=1, shape=(sensor.height, sensor.width), dtype=np.float32)
+                })
+            else:
+                # Multiple cameras
+                d = {}
+                for name, sensor in self.sensors.items():
+                    d[name] = spaces.Dict({
+                        "rgb": spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width, 3), dtype=np.uint8),
+                        "depth": spaces.Box(low=0, high=1, shape=(sensor.height, sensor.width), dtype=np.float32)
+                    })
+                return spaces.Dict(d)
+                
+        elif self.obs_mode == "visual":
+            # Return all visual data from cameras
+            if len(self.sensors) == 1:
+                # Single camera
+                sensor_name = next(iter(self.sensors.keys()))
+                sensor = self.sensors[sensor_name]
+                return spaces.Dict({
+                    "rgb": spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width, 3), dtype=np.uint8),
+                    "depth": spaces.Box(low=0, high=1, shape=(sensor.height, sensor.width), dtype=np.float32),
+                    "segmentation": spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width), dtype=np.int32)
+                })
+            else:
+                # Multiple cameras
+                d = {}
+                for name, sensor in self.sensors.items():
+                    d[name] = spaces.Dict({
+                        "rgb": spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width, 3), dtype=np.uint8),
+                        "depth": spaces.Box(low=0, high=1, shape=(sensor.height, sensor.width), dtype=np.float32),
+                        "segmentation": spaces.Box(low=0, high=255, shape=(sensor.height, sensor.width), dtype=np.int32)
+                    })
+                return spaces.Dict(d)
 
     def create_cfg_dexdeform(self):
         cfg_file = os.path.join(os.path.dirname(__file__), f"env_cfgs/{self.task_name}.yml")
@@ -263,7 +352,8 @@ class Hand(MPMWarpEnvMixin, WarpEnv):
             joint_act = self.scatter_actions(self.joint_act, self.joint_act_indices, acts)
             self.control.assign("joint_act", joint_act.flatten())
 
-    def compute_observations(self):
+    def _get_state_obs(self):
+        """Get state observations (particle positions, COM, joint states)."""
         joint_q = self.state.joint_q.clone().view(self.num_envs, -1)
         particle_q = self.state.mpm_x.clone().view(self.num_envs, -1, 3)
 
@@ -277,15 +367,30 @@ class Hand(MPMWarpEnvMixin, WarpEnv):
 
         com_q = particle_q.mean(1)
 
-        self.obs_buf = {
+        return {
             "joint_q": joint_q,
             "particle_q": particle_q,
             "com_q": com_q,
         }
+        
+    def compute_observations(self):
+        """Compute observations based on observation mode."""
+        # Get observations using parent class implementation
+        # This will call either _get_state_obs or get_sensor_obs based on obs_mode
+        self.obs_buf = super().compute_observations()
 
     def compute_reward(self):
-        particle_q = self.obs_buf["particle_q"]
-        com_q = self.obs_buf["com_q"]
+        # For visual observations, we need to calculate rewards based on state
+        # TODO: add reward for 
+        if self.obs_mode in ["rgb", "depth", "rgbd", "visual"]:
+            # Get state observations to compute reward
+            state_obs = self._get_state_obs()
+            particle_q = state_obs["particle_q"]
+            com_q = state_obs["com_q"]
+        else:
+            # For state observations, we can use the obs_buf directly
+            particle_q = self.obs_buf["particle_q"]
+            com_q = self.obs_buf["com_q"]
 
         if self.task_name == "lift":
             rew = com_q[:, 1]  # maximize height
@@ -398,4 +503,17 @@ class Hand(MPMWarpEnvMixin, WarpEnv):
 
 
 if __name__ == "__main__":
-    run_env(Hand, no_grad=False)
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--obs_mode", type=str, default="state", 
+                        choices=["state", "rgb", "depth", "rgbd", "visual"],
+                        help="Observation mode to use")
+    parser.add_argument("--task", type=str, default="flip", 
+                        choices=["flip", "lift"],
+                        help="Task to run")
+    
+    args, unknown = parser.parse_known_args()
+    
+    # Pass the observation mode to the environment
+    run_env(Hand, no_grad=False, task_name=args.task, obs_mode=args.obs_mode)
