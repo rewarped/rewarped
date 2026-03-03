@@ -18,7 +18,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "warp-lang",
+    "warp-lang>=1.7.0",
     "usd-core==24.5",
     "trimesh",
     "pycollada",
